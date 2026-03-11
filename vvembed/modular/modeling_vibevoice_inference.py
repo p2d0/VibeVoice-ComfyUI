@@ -790,14 +790,15 @@ class VibeVoiceForConditionalGenerationInference(VibeVoicePreTrainedModel, Gener
                 
                 # --- Volume & Drift Stabilization ---
                 # Prevent amplitude runaway on long continuous generations.
-                # VAE latents are trained with global mean=0, std=1. 
-                # We soft-cap std and pull mean towards 0 to prevent autoregressive feedback loops.
+                # We soft-cap the variance to prevent the volume feedback loop,
+                # but DO NOT center the mean, as the channel-wise bias encodes speaker identity!
                 latent_std = speech_latent.std(dim=-1, keepdim=True)
-                latent_mean = speech_latent.mean(dim=-1, keepdim=True)
-                
                 max_std = 1.5
                 scale_correction = torch.clamp(max_std / (latent_std + 1e-5), max=1.0)
-                speech_latent = (speech_latent - latent_mean * 0.5) * scale_correction
+                speech_latent = speech_latent * scale_correction
+                
+                # Hard clamp as a final safety net against extreme artifacts
+                speech_latent = torch.clamp(speech_latent, -4.0, 4.0)
                 # ------------------------------------
                 
                 speech_latent = speech_latent.unsqueeze(1)
