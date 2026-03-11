@@ -790,15 +790,16 @@ class VibeVoiceForConditionalGenerationInference(VibeVoicePreTrainedModel, Gener
                 
                 # --- Volume & Drift Stabilization ---
                 # Prevent amplitude runaway on long continuous generations.
-                # We soft-cap the variance to prevent the volume feedback loop,
-                # but DO NOT center the mean, as the channel-wise bias encodes speaker identity!
+                # CRITICAL: We must center the calculation around the latent's own mean
+                # to strictly preserve the speaker's identity and prevent distortion drift.
+                latent_mean = speech_latent.mean(dim=-1, keepdim=True)
                 latent_std = speech_latent.std(dim=-1, keepdim=True)
-                max_std = 1.5
-                scale_correction = torch.clamp(max_std / (latent_std + 1e-5), max=1.0)
-                speech_latent = speech_latent * scale_correction
                 
-                # Hard clamp as a final safety net against extreme artifacts
-                speech_latent = torch.clamp(speech_latent, -4.0, 4.0)
+                max_std = 2.0  # Allow a natural dynamic range
+                scale_correction = torch.clamp(max_std / (latent_std + 1e-5), max=1.0)
+                
+                # Apply scale ONLY to the variance, leaving the structural mean completely untouched
+                speech_latent = latent_mean + (speech_latent - latent_mean) * scale_correction
                 # ------------------------------------
                 
                 speech_latent = speech_latent.unsqueeze(1)
@@ -878,10 +879,14 @@ class VibeVoiceForConditionalGenerationInference(VibeVoicePreTrainedModel, Gener
             half_eps = uncond_eps + cfg_scale * (cond_eps - uncond_eps)
             
             if cfg_rescale > 0 and cfg_scale > 1.0:
+                # Calculate std but preserve the structural mean
+                mean_half = half_eps.mean(dim=-1, keepdim=True)
                 std_cond = cond_eps.std(dim=-1, keepdim=True)
                 std_half = half_eps.std(dim=-1, keepdim=True)
                 std_half = torch.clamp(std_half, min=1e-5)
-                rescaled_half_eps = half_eps * (std_cond / std_half)
+                
+                # Rescale ONLY the variance portion to prevent mean-drift distortion
+                rescaled_half_eps = mean_half + (half_eps - mean_half) * (std_cond / std_half)
                 half_eps = cfg_rescale * rescaled_half_eps + (1.0 - cfg_rescale) * half_eps
                 
             eps = torch.cat([half_eps, half_eps], dim=0)
