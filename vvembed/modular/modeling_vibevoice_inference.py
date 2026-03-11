@@ -786,7 +786,21 @@ class VibeVoiceForConditionalGenerationInference(VibeVoicePreTrainedModel, Gener
                     negative_condition,
                     cfg_scale=cfg_scale,
                     cfg_rescale=cfg_rescale,
-                ).unsqueeze(1)
+                )
+                
+                # --- Volume & Drift Stabilization ---
+                # Prevent amplitude runaway on long continuous generations.
+                # VAE latents are trained with global mean=0, std=1. 
+                # We soft-cap std and pull mean towards 0 to prevent autoregressive feedback loops.
+                latent_std = speech_latent.std(dim=-1, keepdim=True)
+                latent_mean = speech_latent.mean(dim=-1, keepdim=True)
+                
+                max_std = 1.5
+                scale_correction = torch.clamp(max_std / (latent_std + 1e-5), max=1.0)
+                speech_latent = (speech_latent - latent_mean * 0.5) * scale_correction
+                # ------------------------------------
+                
+                speech_latent = speech_latent.unsqueeze(1)
                                 
                 # Decode acoustic latent to audio using acoustic streaming cache
                 scaled_latent = speech_latent / self.model.speech_scaling_factor.to(speech_latent.device) - self.model.speech_bias_factor.to(speech_latent.device)
