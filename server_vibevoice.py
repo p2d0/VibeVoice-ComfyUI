@@ -82,6 +82,7 @@ class TTSRequest(BaseModel):
     ref_file_path: Optional[str] = None
     seed: int = 42
     cfg_scale: Optional[float] = None
+    cfg_rescale: Optional[float] = None
     diffusion_steps: Optional[int] = None
     temperature: Optional[float] = None
     top_p: Optional[float] = None
@@ -180,6 +181,7 @@ async def generate(request: TTSRequest):
 
         # 2. Resolve Parameters
         cfg_scale = float(get_resolved_param(request_config, "cfg_scale", active_suffix, request.cfg_scale, 2.0))
+        cfg_rescale = float(get_resolved_param(request_config, "cfg_rescale", active_suffix, request.cfg_rescale, 0.75))
         diffusion_steps = int(get_resolved_param(request_config, "diffusion_steps", active_suffix, request.diffusion_steps, 20))
         temperature = float(get_resolved_param(request_config, "temperature", active_suffix, request.temperature, 0.95))
         top_p = float(get_resolved_param(request_config, "top_p", active_suffix, request.top_p, 0.95))
@@ -202,7 +204,9 @@ async def generate(request: TTSRequest):
         # 4. Prepare Model Inputs
         # VibeVoiceProcessor expects every line to have a speaker prefix.
         # We ensure each line starts with the [N]: format.
-        lines = [line.strip() for line in request.gen_text.split('\n') if line.strip()]
+        # We add a speaker marker after every period to encourage sentence-by-sentence generation.
+        processed_text = request.gen_text.replace('.', '.\n[1]: ')
+        lines = [line.strip() for line in processed_text.split('\n') if line.strip()]
         formatted_lines = []
         for line in lines:
             # Check if line already has a valid marker ([N]: or Speaker N:)
@@ -213,12 +217,14 @@ async def generate(request: TTSRequest):
                 formatted_lines.append(f"[1]: {line}")
         
         formatted_text = "\n".join(formatted_lines)
+        print(formatted_text)
         
         inputs = processor(
             [formatted_text],
             voice_samples=[[wav]],
             return_tensors="pt"
         )
+
         
         # Move to device
         device = next(model.parameters()).device
@@ -227,7 +233,7 @@ async def generate(request: TTSRequest):
         model.set_ddpm_inference_steps(diffusion_steps)
 
         print(f"--- Request: {request.gen_text[:50]}... | Voice: {active_suffix} ---")
-        print(f"--- Params: cfg={cfg_scale}, steps={diffusion_steps}, temp={temperature}, top_p={top_p}, sampling={use_sampling} ---")
+        print(f"--- Params: rescale={cfg_rescale} cfg={cfg_scale}, steps={diffusion_steps}, temp={temperature}, top_p={top_p}, sampling={use_sampling} ---")
         
         # Generate
         with torch.no_grad():
@@ -235,6 +241,7 @@ async def generate(request: TTSRequest):
                 **inputs,
                 tokenizer=processor.tokenizer,
                 cfg_scale=cfg_scale,
+                cfg_rescale=cfg_rescale,
                 do_sample=use_sampling,
                 temperature=temperature,
                 top_p=top_p,
@@ -244,6 +251,10 @@ async def generate(request: TTSRequest):
         if hasattr(output, 'speech_outputs') and output.speech_outputs:
             audio_tensor = torch.cat(output.speech_outputs, dim=-1)
             audio_np = audio_tensor.cpu().float().numpy().squeeze()
+            
+            # Apply normalization to the generated output to prevent loudness drift and clipping
+            if processor.audio_normalizer:
+                audio_np = processor.audio_normalizer(audio_np)
             
             # Buffer output
             buffer = io.BytesIO()

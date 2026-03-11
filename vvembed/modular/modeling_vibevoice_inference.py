@@ -461,6 +461,7 @@ class VibeVoiceForConditionalGenerationInference(VibeVoicePreTrainedModel, Gener
         speech_input_mask: Optional[torch.BoolTensor] = None,
         return_speech: bool = True,
         cfg_scale: float = 1.0,
+        cfg_rescale: float = 0.75,
         stop_check_fn: Optional[Callable[[], bool]] = None,
         **kwargs,
     ) -> Union[torch.LongTensor, VibeVoiceGenerationOutput]:
@@ -784,6 +785,7 @@ class VibeVoiceForConditionalGenerationInference(VibeVoicePreTrainedModel, Gener
                     positive_condition,
                     negative_condition,
                     cfg_scale=cfg_scale,
+                    cfg_rescale=cfg_rescale,
                 ).unsqueeze(1)
                                 
                 # Decode acoustic latent to audio using acoustic streaming cache
@@ -849,7 +851,7 @@ class VibeVoiceForConditionalGenerationInference(VibeVoicePreTrainedModel, Gener
         )
     
     @torch.no_grad()
-    def sample_speech_tokens(self, condition, neg_condition, cfg_scale=3.0):
+    def sample_speech_tokens(self, condition, neg_condition, cfg_scale=3.0, cfg_rescale=0.75):
         self.model.noise_scheduler.set_timesteps(self.ddpm_inference_steps)
         condition = torch.cat([condition, neg_condition], dim=0).to(self.model.prediction_head.device)
         speech = torch.randn(condition.shape[0], self.config.acoustic_vae_dim).to(condition)
@@ -859,6 +861,14 @@ class VibeVoiceForConditionalGenerationInference(VibeVoicePreTrainedModel, Gener
             eps = self.model.prediction_head(combined, t.repeat(combined.shape[0]).to(combined), condition=condition)
             cond_eps, uncond_eps = torch.split(eps, len(eps) // 2, dim=0)
             half_eps = uncond_eps + cfg_scale * (cond_eps - uncond_eps)
+            
+            if cfg_rescale > 0 and cfg_scale > 1.0:
+                std_cond = cond_eps.std(dim=-1, keepdim=True)
+                std_half = half_eps.std(dim=-1, keepdim=True)
+                std_half = torch.clamp(std_half, min=1e-5)
+                rescaled_half_eps = half_eps * (std_cond / std_half)
+                half_eps = cfg_rescale * rescaled_half_eps + (1.0 - cfg_rescale) * half_eps
+                
             eps = torch.cat([half_eps, half_eps], dim=0)
             speech = self.model.noise_scheduler.step(eps, t, speech).prev_sample
         return speech[: len(speech) // 2]
