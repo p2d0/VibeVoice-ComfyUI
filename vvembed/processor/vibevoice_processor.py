@@ -709,7 +709,8 @@ class VibeVoiceProcessor:
                 continue
                 
             # Use regex to handle edge cases like multiple colons
-            match = re.match(r'^Speaker\s+(\d+)\s*:\s*(.*)$', line.strip(), re.IGNORECASE)
+            # Supports both "Speaker 1: text" and "[1]: text" formats
+            match = re.match(r'^(?:Speaker\s+|\[)(\d+)(?:\]|)\s*:\s*(.*)$', line.strip(), re.IGNORECASE)
             
             if match:
                 speaker_id = int(match.group(1))

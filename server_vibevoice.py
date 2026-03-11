@@ -6,9 +6,11 @@ import random
 import logging
 import numpy as np
 import soundfile as sf
+import configparser
+import re
 from fastapi import FastAPI, Response, HTTPException
 from pydantic import BaseModel
-from typing import Optional, List
+from typing import Optional, List, Tuple, Any
 
 # Add vvembed and local paths for imports
 current_dir = os.getcwd()
@@ -31,20 +33,59 @@ except ImportError as e:
 
 app = FastAPI(title="VibeVoice Q4 Server")
 
+# --- 1. Config Initialization ---
+startup_config = configparser.ConfigParser()
+startup_config.optionxform = str
+startup_config.read('./custom_nodes/VibeVoice-ComfyUI/config.ini', encoding='utf-8')
+
+class VoiceShuffler:
+    def __init__(self):
+        self._queue: List[str] = []
+
+    def get_next_voice(self, config_ref_section) -> Tuple[str, str]:
+        current_valid_suffixes = []
+        for key in config_ref_section:
+            if key.startswith('default_file'):
+                suffix = key[len('default_file'):]
+                current_valid_suffixes.append(suffix)
+        if not current_valid_suffixes:
+            return None, ""
+        self._queue = [s for s in self._queue if s in current_valid_suffixes]
+        if not self._queue:
+            self._queue = list(current_valid_suffixes)
+            random.shuffle(self._queue)
+        active_suffix = self._queue.pop(0)
+        ref_file = config_ref_section[f'default_file{active_suffix}']
+        return ref_file, active_suffix
+
+voice_shuffler = VoiceShuffler()
+
+def get_resolved_param(cfg: configparser.ConfigParser, param_name: str, suffix: str, request_val: Any, default_fallback: Any) -> Any:
+    if request_val is not None: return request_val
+    if suffix:
+        specific_key = f"{param_name}{suffix}"
+        if cfg.has_section('Reference') and cfg.has_option('Reference', specific_key):
+            val = cfg.get('Reference', specific_key)
+            if val.lower() in ['true', 'false']: return cfg.getboolean('Reference', specific_key)
+            try: return cfg.getfloat('Reference', specific_key)
+            except: return val
+    return cfg.get('Inference', param_name, fallback=default_fallback)
+
 # Global model and processor
 model = None
 processor = None
 model_lock = torch.cuda.is_available() and True # Use threading lock if needed
 
 class TTSRequest(BaseModel):
-    text: str
-    ref_audio_path: Optional[str] = None
+    gen_text: str
+    voices: Optional[List[str]] = None
+    ref_file_path: Optional[str] = None
     seed: int = 42
-    cfg_scale: float = 1.3
-    diffusion_steps: int = 20
-    temperature: float = 0.95
-    top_p: float = 0.95
-    use_sampling: bool = False
+    cfg_scale: Optional[float] = None
+    diffusion_steps: Optional[int] = None
+    temperature: Optional[float] = None
+    top_p: Optional[float] = None
+    use_sampling: Optional[bool] = None
 
 def load_vibevoice_q4(model_path: str):
     global model, processor
@@ -117,31 +158,65 @@ async def generate(request: TTSRequest):
         raise HTTPException(status_code=500, detail="Model not loaded")
     
     try:
+        request_config = configparser.ConfigParser()
+        request_config.optionxform = str
+        request_config.read('config.ini', encoding='utf-8')
+
+        # 1. Voice Selection
+        active_suffix = ""
+        use_ref_file = request.ref_file_path
+        
+        if not use_ref_file:
+            if request.voices and len(request.voices) > 0:
+                ref_section = request_config['Reference']
+                valid_suffixes = [f"_{v}" if not v.startswith('_') else v for v in request.voices 
+                                 if f"default_file{f'_{v}' if not v.startswith('_') else v}" in ref_section]
+                if valid_suffixes:
+                    active_suffix = random.choice(valid_suffixes)
+                    use_ref_file = ref_section[f"default_file{active_suffix}"]
+            
+            if not use_ref_file:
+                use_ref_file, active_suffix = voice_shuffler.get_next_voice(request_config['Reference'])
+
+        # 2. Resolve Parameters
+        cfg_scale = float(get_resolved_param(request_config, "cfg_scale", active_suffix, request.cfg_scale, 2.0))
+        diffusion_steps = int(get_resolved_param(request_config, "diffusion_steps", active_suffix, request.diffusion_steps, 20))
+        temperature = float(get_resolved_param(request_config, "temperature", active_suffix, request.temperature, 0.95))
+        top_p = float(get_resolved_param(request_config, "top_p", active_suffix, request.top_p, 0.95))
+        use_sampling = bool(get_resolved_param(request_config, "use_sampling", active_suffix, request.use_sampling, False))
+
         # Set seeds
         torch.manual_seed(request.seed)
         np.random.seed(request.seed)
         
-        # Format text
-        formatted_text = f"Speaker 1: {request.text}"
-        
-        # Prepare voice samples
-        voice_samples = []
-        if request.ref_audio_path and os.path.exists(request.ref_audio_path):
-            # Use audio processor to load
-            wav = processor.audio_processor._load_audio_from_path(request.ref_audio_path)
-            if processor.db_normalize:
-                wav = processor.audio_normalizer(wav)
-            voice_samples = [wav]
+        # 3. Prepare Audio Reference
+        if use_ref_file and os.path.exists(use_ref_file):
+            wav = processor.audio_processor._load_audio_from_path(use_ref_file)
         else:
-            # Create synthetic 1s sample as fallback (matching BaseVibeVoiceNode logic)
-            t = np.linspace(0, 1.0, 24000, False)
-            voice_sample = (0.6 * np.sin(2 * np.pi * 120 * t) * np.exp(-t * 0.3)).astype(np.float32)
-            voice_samples = [voice_sample]
+            # Fallback synthetic noise
+            wav = (0.01 * np.random.normal(0, 1, 24000)).astype(np.float32)
+            
+        if processor.db_normalize:
+            wav = processor.audio_normalizer(wav)
 
-        # Process inputs
+        # 4. Prepare Model Inputs
+        # VibeVoiceProcessor expects every line to have a speaker prefix.
+        # We ensure each line starts with the [N]: format.
+        lines = [line.strip() for line in request.gen_text.split('\n') if line.strip()]
+        formatted_lines = []
+        for line in lines:
+            # Check if line already has a valid marker ([N]: or Speaker N:)
+            if re.match(r'^(?:Speaker\s+|\[)(\d+)(?:\]|)\s*:\s*(.*)$', line, re.IGNORECASE):
+                formatted_lines.append(line)
+            else:
+                # Default to [1]: if no marker found
+                formatted_lines.append(f"[1]: {line}")
+        
+        formatted_text = "\n".join(formatted_lines)
+        
         inputs = processor(
             [formatted_text],
-            voice_samples=[voice_samples],
+            voice_samples=[[wav]],
             return_tensors="pt"
         )
         
@@ -149,28 +224,26 @@ async def generate(request: TTSRequest):
         device = next(model.parameters()).device
         inputs = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in inputs.items()}
         
-        model.set_ddpm_inference_steps(request.diffusion_steps)
+        model.set_ddpm_inference_steps(diffusion_steps)
+
+        print(f"--- Request: {request.gen_text[:50]}... | Voice: {active_suffix} ---")
+        print(f"--- Params: cfg={cfg_scale}, steps={diffusion_steps}, temp={temperature}, top_p={top_p}, sampling={use_sampling} ---")
         
         # Generate
         with torch.no_grad():
             output = model.generate(
                 **inputs,
                 tokenizer=processor.tokenizer,
-                cfg_scale=request.cfg_scale,
-                do_sample=request.use_sampling,
-                temperature=request.temperature,
-                top_p=request.top_p,
+                cfg_scale=cfg_scale,
+                do_sample=use_sampling,
+                temperature=temperature,
+                top_p=top_p,
                 max_new_tokens=None
             )
             
         if hasattr(output, 'speech_outputs') and output.speech_outputs:
-            speech_tensors = output.speech_outputs
-            audio_tensor = torch.cat(speech_tensors, dim=-1)
-            
-            # Convert to float32 for soundfile
-            audio_np = audio_tensor.cpu().float().numpy()
-            if audio_np.ndim > 1:
-                audio_np = audio_np.squeeze()
+            audio_tensor = torch.cat(output.speech_outputs, dim=-1)
+            audio_np = audio_tensor.cpu().float().numpy().squeeze()
             
             # Buffer output
             buffer = io.BytesIO()
@@ -187,4 +260,4 @@ async def generate(request: TTSRequest):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8001)
+    uvicorn.run(app, host="0.0.0.0", port=8000)
