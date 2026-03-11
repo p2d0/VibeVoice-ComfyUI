@@ -201,69 +201,76 @@ async def generate(request: TTSRequest):
         if processor.db_normalize:
             wav = processor.audio_normalizer(wav)
 
-        # 4. Prepare Model Inputs
-        # VibeVoiceProcessor expects every line to have a speaker prefix.
-        # We ensure each line starts with the [N]: format.
-        # We add a speaker marker after every period to encourage sentence-by-sentence generation.
-        processed_text = request.gen_text.replace('.', '.\n[1]: ')
-        lines = [line.strip() for line in processed_text.split('\n') if line.strip()]
-        formatted_lines = []
-        for line in lines:
-            # Check if line already has a valid marker ([N]: or Speaker N:)
-            if re.match(r'^(?:Speaker\s+|\[)(\d+)(?:\]|)\s*:\s*(.*)$', line, re.IGNORECASE):
-                formatted_lines.append(line)
-            else:
-                # Default to [1]: if no marker found
-                formatted_lines.append(f"[1]: {line}")
+        # 4. Chunked Generation Logic
+        # We split the text into chunks of ~3 sentences to prevent cumulative drift and distortion.
+        # Each chunk gets a fresh state and re-primes the speaker identity.
         
-        formatted_text = "\n".join(formatted_lines)
-        print(formatted_text)
+        # Simple sentence splitter: look for punctuation followed by whitespace
+        sentences = re.split(r'(?<=[.!?])\s+', request.gen_text.strip().replace('\n', ' '))
+        sentences = [s.strip() for s in sentences if s.strip()]
         
-        inputs = processor(
-            [formatted_text],
-            voice_samples=[[wav]],
-            return_tensors="pt"
-        )
+        if not sentences:
+            raise HTTPException(status_code=400, detail="Empty text provided")
 
+        chunk_size = 5
+        text_chunks = [" ".join(sentences[i:i+chunk_size]) for i in range(0, len(sentences), chunk_size)]
         
-        # Move to device
+        collected_audio = []
         device = next(model.parameters()).device
-        inputs = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in inputs.items()}
-        
         model.set_ddpm_inference_steps(diffusion_steps)
 
-        print(f"--- Request: {request.gen_text[:50]}... | Voice: {active_suffix} ---")
-        print(f"--- Params: rescale={cfg_rescale} cfg={cfg_scale}, steps={diffusion_steps}, temp={temperature}, top_p={top_p}, sampling={use_sampling} ---")
-        
-        # Generate
-        with torch.no_grad():
-            output = model.generate(
-                **inputs,
-                tokenizer=processor.tokenizer,
-                cfg_scale=cfg_scale,
-                cfg_rescale=cfg_rescale,
-                do_sample=use_sampling,
-                temperature=temperature,
-                top_p=top_p,
-                max_new_tokens=None
+        print(f"--- Processing {len(text_chunks)} chunks for voice: {active_suffix} ---")
+
+        for i, chunk_text in enumerate(text_chunks):
+            print(f"Generating Chunk {i+1}/{len(text_chunks)}: {chunk_text[:40]}...")
+            
+            # Format chunk for VibeVoice - reset state per chunk to prevent cumulative speed/distortion issues
+            formatted_chunk = f"[1]: {chunk_text}"
+            
+            inputs = processor(
+                [formatted_chunk],
+                voice_samples=[[wav]],
+                return_tensors="pt"
             )
             
-        if hasattr(output, 'speech_outputs') and output.speech_outputs:
-            audio_tensor = torch.cat(output.speech_outputs, dim=-1)
-            audio_np = audio_tensor.cpu().float().numpy().squeeze()
+            inputs = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in inputs.items()}
             
-            # Apply normalization to the generated output to prevent loudness drift and clipping
-            if processor.audio_normalizer:
-                audio_np = processor.audio_normalizer(audio_np)
+            with torch.no_grad():
+                output = model.generate(
+                    **inputs,
+                    tokenizer=processor.tokenizer,
+                    cfg_scale=cfg_scale,
+                    cfg_rescale=cfg_rescale,
+                    do_sample=use_sampling,
+                    temperature=temperature,
+                    top_p=top_p,
+                    max_new_tokens=None,
+                    show_progress_bar=False  # Keep logs clean during multi-chunk processing
+                )
             
-            # Buffer output
-            buffer = io.BytesIO()
-            sf.write(buffer, audio_np, 24000, format='WAV')
-            buffer.seek(0)
-            
-            return Response(content=buffer.read(), media_type="audio/wav")
-        else:
-            raise Exception("No audio generated")
+            if hasattr(output, 'speech_outputs') and output.speech_outputs:
+                # Filter out None and handle output lists
+                valid_speech = [s for s in output.speech_outputs if s is not None]
+                if valid_speech:
+                    chunk_audio = torch.cat(valid_speech, dim=-1).cpu().float().numpy().squeeze()
+                    collected_audio.append(chunk_audio)
+
+        if not collected_audio:
+            raise Exception("No audio generated in any chunk")
+
+        # Stitch all chunks together into a single continuous waveform
+        final_audio_np = np.concatenate(collected_audio)
+        
+        # Apply final pass normalization to ensure overall consistency
+        if processor.audio_normalizer:
+            final_audio_np = processor.audio_normalizer(final_audio_np)
+        
+        # Buffer output as WAV
+        buffer = io.BytesIO()
+        sf.write(buffer, final_audio_np, 24000, format='WAV')
+        buffer.seek(0)
+        
+        return Response(content=buffer.read(), media_type="audio/wav")
 
     except Exception as e:
         logger.error(f"Generation error: {e}")
@@ -271,4 +278,4 @@ async def generate(request: TTSRequest):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=8001)
