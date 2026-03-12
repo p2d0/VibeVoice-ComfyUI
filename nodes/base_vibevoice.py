@@ -1588,7 +1588,7 @@ class BaseVibeVoiceNode:
                 return f"Speaker 1: {text}"
     
     def _generate_with_vibevoice(self, formatted_text: str, voice_samples: List[np.ndarray],
-                                cfg_scale: float, seed: int, diffusion_steps: int, use_sampling: bool,
+                                cfg_scale: float, cfg_rescale: float, seed: int, diffusion_steps: int, use_sampling: bool,
                                 temperature: float = 0.95, top_p: float = 0.95, llm_lora_strength: float = 1.0) -> dict:
         """Generate audio using VibeVoice model"""
         try:
@@ -1670,6 +1670,7 @@ class BaseVibeVoiceNode:
                         **inputs,
                         tokenizer=self.processor.tokenizer,
                         cfg_scale=cfg_scale,
+                        cfg_rescale=cfg_rescale,
                         max_new_tokens=None,
                         do_sample=True,
                         temperature=temperature,
@@ -1682,6 +1683,7 @@ class BaseVibeVoiceNode:
                         **inputs,
                         tokenizer=self.processor.tokenizer,
                         cfg_scale=cfg_scale,
+                        cfg_rescale=cfg_rescale,
                         max_new_tokens=None,
                         do_sample=False,  # More deterministic generation
                         stop_check_fn=stop_check_fn,

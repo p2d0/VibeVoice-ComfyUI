@@ -55,6 +55,7 @@ class VibeVoiceSingleSpeakerNode(BaseVibeVoiceNode):
                 "diffusion_steps": ("INT", {"default": 20, "min": 1, "max": 100, "step": 1, "tooltip": "Number of denoising steps. More steps = theoretically better quality but slower. Default: 20"}),
                 "seed": ("INT", {"default": 42, "min": 0, "max": 2**32-1, "tooltip": "Random seed for generation. Default 42 is used in official examples"}),
                 "cfg_scale": ("FLOAT", {"default": 1.3, "min": 0.5, "max": 3.5, "step": 0.05, "tooltip": "Classifier-free guidance scale (official default: 1.3)"}),
+                "cfg_rescale": ("FLOAT", {"default": 0.75, "min": 0.0, "max": 1.0, "step": 0.01, "tooltip": "CFG rescaling factor. Helps prevent over-exposure/clipping at high CFG scales (default: 0.75)"}),
                 "use_sampling": ("BOOLEAN", {"default": False, "tooltip": "Enable sampling mode. When False (default), uses deterministic generation like official examples"}),
             },
             "optional": {
@@ -100,6 +101,7 @@ class VibeVoiceSingleSpeakerNode(BaseVibeVoiceNode):
                        attention_type: str = "auto", quantize_llm: str = "full precision",
                        free_memory_after_generate: bool = True,
                        diffusion_steps: int = 20, seed: int = 42, cfg_scale: float = 1.3,
+                       cfg_rescale: float = 0.75,
                        use_sampling: bool = False, voice_to_clone=None, lora=None,
                        temperature: float = 0.95, top_p: float = 0.95,
                        max_words_per_chunk: int = 250, voice_speed_factor: float = 1.0):
@@ -182,7 +184,7 @@ class VibeVoiceSingleSpeakerNode(BaseVibeVoiceNode):
                             
                             # Generate audio for this chunk
                             chunk_audio = self._generate_with_vibevoice(
-                                formatted_text, voice_samples, cfg_scale,
+                                formatted_text, voice_samples, cfg_scale, cfg_rescale,
                                 seed,  # Use same seed for voice consistency
                                 diffusion_steps, use_sampling, temperature, top_p,
                                 llm_lora_strength=llm_lora_strength
@@ -202,7 +204,7 @@ class VibeVoiceSingleSpeakerNode(BaseVibeVoiceNode):
                         
                         # Generate audio
                         segment_audio = self._generate_with_vibevoice(
-                            formatted_text, voice_samples, cfg_scale, seed, diffusion_steps,
+                            formatted_text, voice_samples, cfg_scale, cfg_rescale, seed, diffusion_steps,
                             use_sampling, temperature, top_p, llm_lora_strength=llm_lora_strength
                         )
                         
