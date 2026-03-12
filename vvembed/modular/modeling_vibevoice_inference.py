@@ -790,17 +790,15 @@ class VibeVoiceForConditionalGenerationInference(VibeVoicePreTrainedModel, Gener
                 
                 # --- Volume & Drift Stabilization ---
                 # Prevent amplitude runaway on long continuous generations.
-                expected_norm = speech_latent.shape[-1] ** 0.5
-                max_norm = expected_norm * 1.2  # Tighter dynamic headroom to prevent drift
-                
-                latent_norm = torch.norm(speech_latent, p=2, dim=-1, keepdim=True)
-                scale_correction = torch.clamp(max_norm / (latent_norm + 1e-5), max=1.0)
-                
-                # Uniformly scale to preserve geometry
+                # We soft-cap the variance to prevent the volume feedback loop,
+                # but DO NOT center the mean, as the channel-wise bias encodes speaker identity!
+                latent_std = speech_latent.std(dim=-1, keepdim=True)
+                max_std = 1.5
+                scale_correction = torch.clamp(max_std / (latent_std + 1e-5), max=1.0)
                 speech_latent = speech_latent * scale_correction
                 
-                # Hard clamp to prevent extreme outliers from poisoning the LLM
-                speech_latent = torch.clamp(speech_latent, min=-4.0, max=4.0)
+                # Hard clamp as a final safety net against extreme artifacts
+                speech_latent = torch.clamp(speech_latent, -4.0, 4.0)
                 # ------------------------------------
                 
                 speech_latent = speech_latent.unsqueeze(1)
@@ -815,29 +813,21 @@ class VibeVoiceForConditionalGenerationInference(VibeVoicePreTrainedModel, Gener
                     debug=False
                 )
                 
-                # --- AUDIO CLIP PREVENTION ---
-                # High CFG scales cause the decoded audio to clip (exceed [-1.0, 1.0]).
-                # If clipped audio enters the semantic tokenizer, it hallucinates features,
-                # causing the LLM to speed up generation and distort the voice.
-                # Clamping the audio perfectly stabilizes the semantic feedback loop.
-                feedback_audio_chunk = torch.clamp(audio_chunk, min=-1.0, max=1.0)
-                # -----------------------------
-                
                 # Store audio chunks for each sample
                 for i, sample_idx in enumerate(diffusion_indices):
                     idx = sample_idx.item()
                     # Only append audio chunk if the sample is not finished
                     if not finished_tags[idx]:
-                        audio_chunks[idx].append(feedback_audio_chunk[i])
+                        audio_chunks[idx].append(audio_chunk[i])
 
                  # Add streaming support here
                 if audio_streamer is not None:
                     # Stream the audio chunks immediately
-                    audio_streamer.put(feedback_audio_chunk, diffusion_indices)
+                    audio_streamer.put(audio_chunk, diffusion_indices)
                     
                 # Encode audio to semantic features using semantic streaming cache
                 semantic_features = self.model.semantic_tokenizer.encode(
-                    feedback_audio_chunk,
+                    audio_chunk,
                     cache=semantic_cache,  # Use semantic-specific cache
                     sample_indices=diffusion_indices,
                     use_cache=True,
